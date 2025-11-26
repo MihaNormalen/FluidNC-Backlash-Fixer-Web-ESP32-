@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FluidNC Backlash Fixer</title>
+    <style>
+        body { font-family: sans-serif; background: #f0f2f5; padding: 20px; color: #333; }
+        .container { max-width: 600px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+        h2 { color: #0056b3; margin-top: 0; }
+        .form-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; font-weight: bold; }
+        input[type="number"], input[type="file"] { width: 100%; padding: 8px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 4px; }
+        button { background: #0056b3; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; font-size: 16px; width: 100%; }
+        button:hover { background: #004494; }
+        #status { margin-top: 20px; padding: 10px; background: #e9ecef; border-radius: 4px; white-space: pre-wrap; display: none; }
+        .success { color: green; }
+        .error { color: red; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>🛠️ FluidNC Backlash Fixer</h2>
+    <p>Select a G-code file, enter your backlash values, and the script will generate a compensated file.</p>
+
+    <div class="form-group">
+        <label for="bx">X Axis Backlash (mm):</label>
+        <input type="number" id="bx" value="0.5" step="0.01">
+    </div>
+
+    <div class="form-group">
+        <label for="by">Y Axis Backlash (mm):</label>
+        <input type="number" id="by" value="1.6" step="0.01">
+    </div>
+
+    <div class="form-group">
+        <label for="safeFeed">Safe Feed Rate (F):</label>
+        <input type="number" id="safeFeed" value="200">
+    </div>
+
+    <div class="form-group">
+        <label for="fileInput">Select G-code:</label>
+        <input type="file" id="fileInput" accept=".gcode,.nc,.txt">
+    </div>
+
+    <button onclick="processFile()">Process and Save</button>
+
+    <div id="status"></div>
+</div>
+
+<script>
+class FluidNCSafeBacklash {
+    constructor(bx, by, threshold = 0.05, safeFeed = 200) {
+        this.bx = bx;
+        this.by = by;
+        this.threshold = threshold;
+        this.safeFeed = safeFeed;
+        
+        // Logical position tracking
+        this.current_x = 0.0;
+        this.current_y = 0.0;
+        
+        // Offset tracking
+        this.offset_x = 0.0;
+        this.offset_y = 0.0;
+        
+        // Directions: 0=Unknown, 1=Positive, -1=Negative
+        this.dir_x = 0;
+        this.dir_y = 0;
+    }
+
+    processLine(originalLine, currentFeed) {
+        let newLines = [];
+        let line = originalLine.trim();
+        
+        if (!line || line.startsWith(';')) {
+            return { lines: [originalLine], newFeed: currentFeed };
+        }
+
+        // 1. Parsing
+        let target_x = this.current_x;
+        let target_y = this.current_y;
+        let target_z = null;
+        let has_move = false;
+        let nextFeed = currentFeed;
+
+        // Regex for parsing values
+        const rx = /X([-\d\.]+)/;
+        const ry = /Y([-\d\.]+)/;
+        const rz = /Z([-\d\.]+)/;
+        const rf = /F([-\d\.]+)/;
+
+        let mx = line.match(rx);
+        if (mx) { target_x = parseFloat(mx[1]); has_move = true; }
+
+        let my = line.match(ry);
+        if (my) { target_y = parseFloat(my[1]); has_move = true; }
+
+        let mz = line.match(rz);
+        if (mz) { target_z = parseFloat(mz[1]); }
+
+        let mf = line.match(rf);
+        if (mf) { nextFeed = parseFloat(mf[1]); }
+
+        if (!has_move) {
+            return { lines: [originalLine], newFeed: nextFeed };
+        }
+
+        // 2. X Axis Logic
+        let dx = target_x - this.current_x;
+        if (Math.abs(dx) > this.threshold) {
+            let new_dir_x = dx > 0 ? 1 : -1;
+            if (this.dir_x !== 0 && new_dir_x !== this.dir_x) {
+                let change = new_dir_x === 1 ? this.bx : -this.bx;
+                this.offset_x += change;
+
+                let phys_x = this.current_x + this.offset_x;
+                let phys_y = this.current_y + this.offset_y;
+                
+                // Prevent negative coordinates (Soft Limit safety)
+                if (phys_x < 0) phys_x = 0;
+                if (phys_y < 0) phys_y = 0;
+
+                newLines.push(`; --- FIX X Backlash: ${change.toFixed(3)}mm ---`);
+                newLines.push(`G0 X${phys_x.toFixed(3)} Y${phys_y.toFixed(3)} F${this.safeFeed}`);
+            }
+            this.dir_x = new_dir_x;
+        }
+
+        // 3. Y Axis Logic
+        let dy = target_y - this.current_y;
+        if (Math.abs(dy) > this.threshold) {
+            let new_dir_y = dy > 0 ? 1 : -1;
+            if (this.dir_y !== 0 && new_dir_y !== this.dir_y) {
+                let change = new_dir_y === 1 ? this.by : -this.by;
+                this.offset_y += change;
+
+                let phys_x = this.current_x + this.offset_x;
+                let phys_y = this.current_y + this.offset_y;
+
+                // Prevent negative coordinates
+                if (phys_x < 0) phys_x = 0;
+                if (phys_y < 0) phys_y = 0;
+
+                newLines.push(`; --- FIX Y Backlash: ${change.toFixed(3)}mm ---`);
+                newLines.push(`G0 X${phys_x.toFixed(3)} Y${phys_y.toFixed(3)} F${this.safeFeed}`);
+            }
+            this.dir_y = new_dir_y;
+        }
+
+        // 4. Output original move with offset applied
+        let final_x = target_x + this.offset_x;
+        let final_y = target_y + this.offset_y;
+
+        if (final_x < 0) final_x = 0;
+        if (final_y < 0) final_y = 0;
+
+        let cmd = line.toUpperCase().includes("G0") ? "G0" : "G1";
+        let out = `${cmd} X${final_x.toFixed(3)} Y${final_y.toFixed(3)}`;
+        
+        if (target_z !== null) out += ` Z${target_z.toFixed(3)}`;
+        if (cmd === "G1") out += ` F${parseInt(nextFeed)}`;
+
+        newLines.push(out);
+
+        this.current_x = target_x;
+        this.current_y = target_y;
+
+        return { lines: newLines, newFeed: nextFeed };
+    }
+}
+
+function processFile() {
+    const fileInput = document.getElementById('fileInput');
+    const statusDiv = document.getElementById('status');
+    const bx = parseFloat(document.getElementById('bx').value);
+    const by = parseFloat(document.getElementById('by').value);
+    const safeFeed = parseFloat(document.getElementById('safeFeed').value);
+
+    if (!fileInput.files.length) {
+        alert("Please select a file!");
+        return;
+    }
+
+    const file = fileInput.files[0];
+    const reader = new FileReader();
+
+    statusDiv.style.display = 'block';
+    statusDiv.innerHTML = "Reading file...";
+
+    reader.onload = function(e) {
+        const content = e.target.result;
+        const lines = content.split(/\r?\n/);
+        
+        const fixer = new FluidNCSafeBacklash(bx, by, 0.05, safeFeed);
+        let newGcode = [];
+        
+        // Header
+        newGcode.push("G90 ; Absolute positioning");
+        newGcode.push("G21 ; Millimeters");
+
+        let currentFeed = 500;
+
+        lines.forEach(line => {
+            const result = fixer.processLine(line, currentFeed);
+            currentFeed = result.newFeed;
+            result.lines.forEach(l => newGcode.push(l));
+        });
+
+        newGcode.push("M2 ; End of G-code");
+
+        // Create download blob
+        const blob = new Blob([newGcode.join("\n")], { type: "text/plain" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "fixed_" + file.name;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+
+        statusDiv.innerHTML = `<span class="success">Success! Downloading 'fixed_${file.name}'.</span>`;
+    };
+
+    reader.onerror = function() {
+        statusDiv.innerHTML = `<span class="error">Error reading file.</span>`;
+    };
+
+    reader.readAsText(file);
+}
+</script>
+
+</body>
+</html>
